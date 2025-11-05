@@ -1,0 +1,371 @@
+"""
+train_qa_hf.py
+
+用法示例:
+  pip install -U transformers datasets accelerate
+  python train_qa_hf.py \
+    --model_name_or_path deepset/roberta-base-squad2 \
+    --train_file path/to/train.jsonl \
+    --validation_file path/to/valid.jsonl \
+    --output_dir ./qa_finetuned
+
+注意:
+- 如果需要处理超长上下文，建议选 BigBird/Longformer 类型模型并将 model_name_or_path 改为对应模型。
+- 本脚本实现了 sliding-window tokenization 以处理长上下文。
+"""
+
+import argparse
+import json
+from pathlib import Path
+from typing import Optional, Union, List, Dict
+
+import numpy as np
+from datasets import load_dataset, DatasetDict, Dataset, load_metric
+from transformers import (
+    AutoTokenizer,
+    AutoModelForQuestionAnswering,
+    TrainingArguments,
+    Trainer,
+    default_data_collator,
+)
+import collections
+
+# ----------------------------
+# Utils: parse args
+# ----------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="Fine-tune HF model for QA (SQuAD-style)")
+    parser.add_argument("--model_name_or_path", type=str, default="deepset/roberta-base-squad2")
+    parser.add_argument("--train_file", type=str, required=True, help="训练文件（json 或 jsonl，SQuAD格式）")
+    parser.add_argument("--validation_file", type=str, required=True, help="验证文件（json 或 jsonl）")
+    parser.add_argument("--output_dir", type=str, default="./qa_finetuned")
+    parser.add_argument("--max_length", type=int, default=1024, help="tokenizer 最大长度（适配 long model）")
+    parser.add_argument("--doc_stride", type=int, default=128, help="sliding window stride")
+    parser.add_argument("--pad_to_max_length", action="store_true", help="是否 pad 到 max_length（训练速度快但显存更大）")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=2)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=4)
+    parser.add_argument("--learning_rate", type=float, default=3e-5)
+    parser.add_argument("--num_train_epochs", type=int, default=3)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--logging_steps", type=int, default=100)
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use_fast_tokenizer", action="store_true", help="使用fast tokenizer（默认否）")
+    return parser.parse_args()
+
+# ----------------------------
+# Helpers: load jsonl or squad-like file
+# ----------------------------
+def load_jsonl_or_squad_like(path: Union[str, Path]) -> Dataset:
+    """
+    支持：
+      - 单行 JSON 每行为 {"id":.., "context":.., "question":.., "answers": {"text":[..], "answer_start":[..]}}
+      - 或者 SQuAD 标准 dict: {"data":[{"title":.., "paragraphs":[...]}, ...]}
+    返回 datasets.Dataset，字段: id, context, question, answers
+    """
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix in [".jsonl", ".ndjson"]:
+        # 每行一个 json
+        examples = []
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                # ensure answers field exists
+                if "answers" not in item:
+                    # 如果有 single answer 字段，尝试包装
+                    text = item.get("answer") or item.get("prediction") or ""
+                    start = item.get("answer_start", 0)
+                    item["answers"] = {"text": [text] if text else [], "answer_start":[start] if text else []}
+                examples.append(item)
+        return Dataset.from_list(examples)
+
+    # else maybe a SQuAD style .json
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    # try to parse SQuAD structure
+    if isinstance(data, dict) and "data" in data:
+        examples = []
+        for entry in data["data"]:
+            for para in entry.get("paragraphs", []):
+                context = para["context"]
+                for qa in para["qas"]:
+                    qid = qa.get("id", "")
+                    question = qa.get("question", "")
+                    answers = qa.get("answers", [])
+                    # convert to our format
+                    text_list = [a["text"] for a in answers] if answers else []
+                    starts = [a["answer_start"] for a in answers] if answers else []
+                    examples.append({"id": qid, "context": context, "question": question, "answers": {"text": text_list, "answer_start": starts}})
+        return Dataset.from_list(examples)
+    raise ValueError("无法识别的数据格式，请提供 jsonl 或 SQuAD-style json")
+
+# ----------------------------
+# Preprocessing: sliding window for long contexts
+# ----------------------------
+def prepare_train_features(examples, tokenizer, max_length, doc_stride, pad_to_max_length):
+    # examples: batch of dicts with fields 'context','question','answers'
+    tokenized_examples = tokenizer(
+        examples["question"],
+        examples["context"],
+        truncation="only_second",
+        max_length=max_length,
+        stride=doc_stride,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length" if pad_to_max_length else False,
+    )
+
+    # 因为一个原始样本可能被切成多个 tokenized chunk
+    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+    offset_mapping = tokenized_examples.pop("offset_mapping")
+
+    start_positions = []
+    end_positions = []
+
+    for i, offsets in enumerate(offset_mapping):
+        input_ids = tokenized_examples["input_ids"][i]
+        # 原始样本 index
+        sample_idx = sample_mapping[i]
+        answers = examples["answers"][sample_idx]
+        # 如果没有标注答案（可能训练集中有无答案），将 start/end 设为 0
+        if len(answers["answer_start"]) == 0:
+            start_positions.append(0)
+            end_positions.append(0)
+        else:
+            # 取第一个参考答案（也可以取最短/最长或做随机）
+            start_char = answers["answer_start"][0]
+            answer_text = answers["text"][0]
+            end_char = start_char + len(answer_text)
+
+            # 找到 token 在 context 中对应的 span
+            sequence_ids = tokenized_examples.sequence_ids(i)
+            # find the start and end of the context in the tokenized input
+            token_start_index = 0
+            while sequence_ids[token_start_index] != 1:
+                token_start_index += 1
+            token_end_index = len(input_ids) - 1
+            while sequence_ids[token_end_index] != 1:
+                token_end_index -= 1
+
+            # 如果答案不在这个 chunk 中，则标注为 (0,0)
+            if not (offsets[token_start_index][0] <= start_char and offsets[token_end_index][1] >= end_char):
+                start_positions.append(0)
+                end_positions.append(0)
+            else:
+                # 向前找到起始 token
+                idx = token_start_index
+                while idx <= token_end_index and offsets[idx][0] <= start_char:
+                    idx += 1
+                start_positions.append(idx - 1)
+
+                # 向后找到结束 token
+                idx = token_end_index
+                while idx >= token_start_index and offsets[idx][1] >= end_char:
+                    idx -= 1
+                end_positions.append(idx + 1)
+
+    tokenized_examples["start_positions"] = start_positions
+    tokenized_examples["end_positions"] = end_positions
+    return tokenized_examples
+
+def prepare_validation_features(examples, tokenizer, max_length, doc_stride, pad_to_max_length):
+    # Similar to train but keep offset mapping to convert predictions back to text
+    tokenized_examples = tokenizer(
+        examples["question"],
+        examples["context"],
+        truncation="only_second",
+        max_length=max_length,
+        stride=doc_stride,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length" if pad_to_max_length else False,
+    )
+    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+    tokenized_examples["example_id"] = []
+
+    for i, offsets in enumerate(tokenized_examples["offset_mapping"]):
+        sample_idx = sample_mapping[i]
+        tokenized_examples["example_id"].append(examples["id"][sample_idx])
+
+        # 在评估阶段，我们只关心 context tokens 的 offsets（question 部分设为 None）
+        sequence_ids = tokenized_examples.sequence_ids(i)
+        new_offsets = []
+        for idx, o in enumerate(offsets):
+            if sequence_ids[idx] != 1:
+                new_offsets.append((0, 0))
+            else:
+                new_offsets.append(o)
+        tokenized_examples["offset_mapping"][i] = new_offsets
+
+    return tokenized_examples
+
+# ----------------------------
+# postprocess predictions -> SQuAD format (for compute_metrics)
+# ----------------------------
+def postprocess_qa_predictions(examples, features, raw_predictions, n_best_size=20, max_answer_length=30):
+    """
+    将模型的 start_logits/end_logits 转为文本答案，返回 dict: {id: predicted_text}
+    """
+    all_start_logits, all_end_logits = raw_predictions
+    example_id_to_index = {k: i for i, k in enumerate(examples["id"])}
+    features_per_example = collections.defaultdict(list)
+    for i, feature in enumerate(features):
+        features_per_example[feature["example_id"]].append(i)
+
+    predictions = collections.OrderedDict()
+
+    for example in examples:
+        example_id = example["id"]
+        context = example["context"]
+        feature_indices = features_per_example[example_id]
+
+        prelim_predictions = []
+
+        for fi in feature_indices:
+            start_logits = all_start_logits[fi]
+            end_logits = all_end_logits[fi]
+            offset_mapping = features[fi]["offset_mapping"]
+            # 取 top n_best_size start & end
+            start_indexes = np.argsort(start_logits)[-1: -n_best_size - 1: -1].tolist()
+            end_indexes = np.argsort(end_logits)[-1: -n_best_size - 1: -1].tolist()
+            for start_index in start_indexes:
+                for end_index in end_indexes:
+                    # skip if out of range or end < start
+                    if start_index >= len(offset_mapping) or end_index >= len(offset_mapping):
+                        continue
+                    if offset_mapping[start_index] == (0, 0) or offset_mapping[end_index] == (0, 0):
+                        continue
+                    if end_index < start_index:
+                        continue
+                    # answer length filter
+                    length = offset_mapping[end_index][1] - offset_mapping[start_index][0]
+                    if length > max_answer_length:
+                        continue
+
+                    prelim_predictions.append({
+                        "feature_index": fi,
+                        "start_index": start_index,
+                        "end_index": end_index,
+                        "start_logit": float(start_logits[start_index]),
+                        "end_logit": float(end_logits[end_index]),
+                    })
+
+        if not prelim_predictions:
+            predictions[example_id] = ""
+            continue
+
+        # pick best by sum logits
+        best_pred = max(prelim_predictions, key=lambda x: x["start_logit"] + x["end_logit"])
+        feature = features[best_pred["feature_index"]]
+        start_char = feature["offset_mapping"][best_pred["start_index"]][0]
+        end_char = feature["offset_mapping"][best_pred["end_index"]][1]
+        predictions[example_id] = context[start_char:end_char]
+
+    return predictions
+
+# ----------------------------
+# compute metrics: F1 + EM using datasets metric
+# ----------------------------
+def compute_metrics_for_validation(predictions, references):
+    # predictions: dict {id: pred_text}
+    # references: list of dicts {"id": id, "answers": {"text":[...]} }
+    # We'll use squad metric from datasets
+    metric = load_metric("squad")
+    preds_list = [{"id": k, "prediction_text": v} for k, v in predictions.items()]
+    refs_list = [{"id": r["id"], "answers": r["answers"]} for r in references]
+    res = metric.compute(predictions=preds_list, references=refs_list)
+    return res  # contains 'exact' and 'f1'
+
+# ----------------------------
+# main
+# ----------------------------
+def main():
+    args = parse_args()
+
+    # load tokenizer & model
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    model = AutoModelForQuestionAnswering.from_pretrained(args.model_name_or_path)
+
+    # load datasets
+    train_ds = load_jsonl_or_squad_like(args.train_file)
+    valid_ds = load_jsonl_or_squad_like(args.validation_file)
+
+    ds = DatasetDict({"train": train_ds, "validation": valid_ds})
+
+    # tokenizer preprocessing (map)
+    def train_map_fn(examples):
+        return prepare_train_features(examples, tokenizer, args.max_length, args.doc_stride, args.pad_to_max_length)
+    def val_map_fn(examples):
+        return prepare_validation_features(examples, tokenizer, args.max_length, args.doc_stride, args.pad_to_max_length)
+
+    tokenized_train = ds["train"].map(train_map_fn, batched=True, remove_columns=ds["train"].column_names)
+    tokenized_valid = ds["validation"].map(val_map_fn, batched=True, remove_columns=ds["validation"].column_names)
+
+    # Training args
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        evaluation_strategy="steps",
+        eval_steps=args.save_steps,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        save_total_limit=3,
+        num_train_epochs=args.num_train_epochs,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        fp16=True if (torch.cuda.is_available()) else False,
+        push_to_hub=False,
+        seed=args.seed,
+        report_to=["none"],
+    )
+
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_valid,
+        tokenizer=tokenizer,
+        data_collator=default_data_collator,
+    )
+
+    # Train
+    trainer.train()
+
+    # 验证：先用 trainer.predict 得到 logits，然后后处理
+    import torch
+    features_for_validation = tokenized_valid  # features 保留 offset_mapping 和 example_id
+    # 将 features 转为 list-of-dicts，便于 postprocess
+    features = [{k: features_for_validation[k][i] for k in features_for_validation.column_names} for i in range(len(features_for_validation))]
+    examples_for_validation = ds["validation"]  # 原始 examples，包含 id/context/answers
+
+    # 获取模型 logits（若数据量大建议分批处理）
+    raw_pred = trainer.predict(features_for_validation)
+    start_logits = raw_pred.predictions[0]
+    end_logits = raw_pred.predictions[1]
+
+    # postprocess -> id->text
+    predictions = postprocess_qa_predictions(examples_for_validation, features, (start_logits, end_logits))
+
+    # compute metrics
+    references = [{"id": ex["id"], "answers": ex["answers"]} for ex in examples_for_validation]
+    metrics = compute_metrics_for_validation(predictions, references)
+
+    print("=== Final Evaluation ===")
+    print(f"Exact Match: {metrics['exact']:.4f}")
+    print(f"F1: {metrics['f1']:.4f}")
+
+    # save predictions
+    out_pred_file = Path(args.output_dir) / "predictions.json"
+    out_pred_file.parent.mkdir(parents=True, exist_ok=True)
+    with out_pred_file.open("w", encoding="utf-8") as f:
+        json.dump(predictions, f, ensure_ascii=False, indent=2)
+    print(f"Predictions saved to {out_pred_file}")
+
+if __name__ == "__main__":
+    import torch
+    main()
