@@ -1,0 +1,202 @@
+# ======================================
+# Emotion Classification for Long Texts (GPU加速版)
+# Compatible with PyCharm
+# ======================================
+
+import os
+import torch
+import pandas as pd
+import numpy as np
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding
+)
+import evaluate
+
+# 检查GPU是否可用
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print(f"✅ 检测到可用GPU: {torch.cuda.get_device_name(0)}")
+    print(f"   GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.2f} GB")
+else:
+    raise RuntimeError("❌ 未检测到可用GPU，请检查CUDA配置")
+
+# ==============================
+# Step 1. 数据导入与清洗
+# ==============================
+
+data_path = r"emotion_data.csv"  # 请修改为你的数据路径
+
+if not os.path.exists(data_path):
+    raise FileNotFoundError(f"❌ 未找到文件: {data_path}")
+
+# 读取并清洗数据
+df = pd.read_csv(data_path).reset_index(drop=True)
+print("✅ 成功读取数据，共 {} 条样本".format(len(df)))
+
+# 数据清洗
+df = df[['text', 'label']].dropna()
+valid_labels = ['positive', 'negative']
+df = df[df['label'].isin(valid_labels)]
+print("✅ 数据清洗完成，剩余 {} 条有效样本".format(len(df)))
+
+# 标签整数化
+label2id = {'negative': 0, 'positive': 1}
+df['label'] = df['label'].map(label2id)
+id2label = {v: k for k, v in label2id.items()}
+print("\nLabel mapping (str→int):", label2id)
+print(df.head())
+
+# 转换为Dataset并删除索引列
+dataset = Dataset.from_pandas(df).remove_columns(["__index_level_0__"])
+print(f"\n✅ Dataset转换完成，包含列：{dataset.column_names}")
+
+# ==============================
+# Step 2. 模型与分词器加载（自动加载到GPU）
+# ==============================
+model_name = "allenai/longformer-base-4096"
+print("\n🔄 正在加载模型与分词器...")
+
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name,
+    padding_side="right"
+)
+
+# 加载模型并自动移动到GPU
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=len(label2id),
+    id2label=id2label,
+    label2id=label2id
+).to(device)  # 关键：将模型移动到GPU
+
+
+# ==============================
+# Step 3. 数据预处理
+# ==============================
+def preprocess_function(examples):
+    return tokenizer(
+        examples["text"],
+        truncation=True,
+        max_length=1024,  # GPU可支持更长文本（根据显存调整）
+        return_overflowing_tokens=False
+    )
+
+
+print("\n🧩 正在对文本进行编码...")
+encoded_dataset = dataset.map(
+    preprocess_function,
+    batched=True,
+    remove_columns=["text"]
+)
+encoded_dataset = encoded_dataset.train_test_split(test_size=0.2, seed=42)
+print("✅ 数据集划分完成：")
+print(f"   - 训练集：{len(encoded_dataset['train'])} 条")
+print(f"   - 测试集：{len(encoded_dataset['test'])} 条")
+
+# 数据整理器（GPU优化版）
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+# ==============================
+# Step 4. 评估指标定义
+# ==============================
+accuracy = evaluate.load("accuracy")
+f1 = evaluate.load("f1")
+
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    return {
+        "accuracy": accuracy.compute(predictions=preds, references=labels)["accuracy"],
+        "f1_macro": f1.compute(predictions=preds, references=labels, average="macro")["f1"]
+    }
+
+
+# ==============================
+# Step 5. 训练参数配置（GPU优化）
+# ==============================
+training_args = TrainingArguments(
+    output_dir="./emotion_results_gpu",
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    learning_rate=2e-5,
+    per_device_train_batch_size=4,  # GPU可增大批次（根据显存调整）
+    per_device_eval_batch_size=8,
+    num_train_epochs=3,  # GPU可增加轮次提升效果
+    weight_decay=0.01,
+    logging_dir='./logs_gpu',
+    logging_steps=200,
+    load_best_model_at_end=True,
+    report_to="none",
+    remove_unused_columns=False,
+    # GPU相关配置
+    fp16=True,  # 混合精度训练，加速且省显存
+    dataloader_pin_memory=True,  # 数据加载到GPU时启用pin_memory加速
+    gradient_accumulation_steps=1  # 显存足够时设为1
+)
+
+# ==============================
+# Step 6. 启动GPU训练
+# ==============================
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=encoded_dataset["train"],
+    eval_dataset=encoded_dataset["test"],
+    compute_metrics=compute_metrics,
+    data_collator=data_collator
+)
+
+print("\n🚀 开始训练模型（GPU模式）...\n")
+trainer.train()
+
+# ==============================
+# Step 7. 模型评估
+# ==============================
+print("\n📊 模型评估结果：")
+metrics = trainer.evaluate()
+print(f"   - 准确率(Accuracy)：{metrics['eval_accuracy']:.4f}")
+print(f"   - 宏F1分数(F1-Macro)：{metrics['eval_f1_macro']:.4f}")
+
+# ==============================
+# Step 8. 保存模型
+# ==============================
+model_save_path = "./emotion_model_gpu"
+model.save_pretrained(model_save_path)
+tokenizer.save_pretrained(model_save_path)
+print(f"\n✅ 模型已保存到：{os.path.abspath(model_save_path)}")
+
+
+# ==============================
+# Step 9. GPU推理预测
+# ==============================
+def predict_emotion(text):
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=1024,
+        padding=True
+    ).to(device)  # 输入数据移动到GPU
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    pred_id = torch.argmax(outputs.logits, dim=-1).item()
+    return id2label[pred_id]
+
+
+# 测试预测
+test_texts = [
+    "The service was great and the food tasted delicious. I will come back again.",
+    "I waited for 2 hours but no one responded. This is the worst experience ever."
+]
+print("\n🧠 预测测试：")
+for i, text in enumerate(test_texts, 1):
+    pred = predict_emotion(text)
+    print(f"   文本{i}：{text[:60]}... → 预测情绪：{pred}")
