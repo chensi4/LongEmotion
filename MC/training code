@@ -1,0 +1,95 @@
+# -*- coding: utf-8 -*-
+import os
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+class Config:
+    model_path = "distilgpt2"  # 小模型节省显存
+    epochs = 1
+    learning_rate = 2e-5
+    max_seq_len = 64
+    batch_size = 2
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+config = Config()
+
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # 镜像加速
+
+class DummyDataset(Dataset):
+    def __init__(self, tokenizer, max_seq_len):
+        self.samples = [
+            "I love this movie!",
+            "I hate this movie!",
+            "It was an average experience."
+        ]
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item = self.tokenizer(
+            self.samples[idx],
+            truncation=True,
+            max_length=self.max_seq_len,
+            padding="max_length",
+            return_tensors="pt"
+        )
+        item = {k: v.squeeze(0) for k, v in item.items()}
+        item["labels"] = item["input_ids"].clone()
+        return item
+
+def train():
+    # --------------------------
+    # 3️⃣ 加载分词器和模型
+    # --------------------------
+    print("🧠 加载模型与分词器...")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_path,
+        trust_remote_code=True
+    )
+
+    # ✅ 修复 pad_token 问题
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_path,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True
+    ).to(config.device)
+
+    dataset = DummyDataset(tokenizer, config.max_seq_len)
+    train_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+
+    print("🧠 开始训练...")
+    model.train()
+    for epoch in range(config.epochs):
+        total_loss = 0
+        for batch in train_loader:
+            batch = {k: v.to(config.device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            total_loss += loss.item()
+
+        print(f"📊 Epoch {epoch + 1} | 平均Loss: {total_loss / len(train_loader):.4f}")
+
+    os.makedirs("./trained_model", exist_ok=True)
+    torch.save(model.state_dict(), "./trained_model/model.pt")
+    print("✅ 模型已保存至：./trained_model/model.pt")
+
+if __name__ == "__main__":
+    print("🚀 开始训练模型...")
+    train()
+    print("✅ 训练结束，模型已保存！")
