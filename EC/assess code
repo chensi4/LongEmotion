@@ -1,0 +1,198 @@
+# 模型评估代码（适配4类情绪标签：happy/sad/neutral/angry）
+# 依赖库：pandas, numpy, evaluate, sklearn, matplotlib
+# ======================================
+
+import os
+import json
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import evaluate
+
+# ------------------------------
+# 1. 配置参数（需根据你的文件路径修改）
+# ------------------------------
+PREDICTION_PATH = r"Emotion_Classification_Result (1).jsonl.txt"  # 记事本中的预测结果路径
+TEST_DATA_PATH = r"emotion_test_data.csv"  # 测试集路径（需含id、true_label列）
+LABEL_MAPPING = {  # 标签映射：文本标签→整数（需与训练时一致）
+    "happy": 0,
+    "sad": 1,
+    "neutral": 2,
+    "angry": 3
+}
+ID2LABEL = {v: k for k, v in LABEL_MAPPING.items()}  # 整数→文本标签（用于结果展示）
+
+
+# ------------------------------
+# 2. 加载预测结果（从jsonl文件）
+# ------------------------------
+def load_predictions(pred_path):
+    """加载预测结果，返回DataFrame（含id、predicted_emotion）"""
+    if not os.path.exists(pred_path):
+        raise FileNotFoundError(f"❌ 未找到预测结果文件：{pred_path}")
+    
+    predictions = []
+    with open(pred_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:  # 跳过空行
+                pred_dict = json.loads(line)
+                predictions.append(pred_dict)
+    
+    # 转为DataFrame并检查标签合法性
+    pred_df = pd.DataFrame(predictions)
+    invalid_labels = pred_df[~pred_df["predicted_emotion"].isin(LABEL_MAPPING.keys())]
+    if not invalid_labels.empty:
+        raise ValueError(f"❌ 预测结果中存在无效标签：{invalid_labels['predicted_emotion'].unique()}")
+    
+    print(f"✅ 成功加载预测结果：共 {len(pred_df)} 条记录")
+    return pred_df
+
+
+# ------------------------------
+# 3. 加载测试集真实标签
+# ------------------------------
+def load_test_true_labels(test_path):
+    """加载测试集真实标签，返回DataFrame（含id、true_label）"""
+    if not os.path.exists(test_path):
+        raise FileNotFoundError(f"❌ 未找到测试集文件：{test_path}")
+    
+    # 读取测试集（假设列名为id、true_label，若不同需修改）
+    test_df = pd.read_csv(test_path, usecols=["id", "true_label"]).dropna()
+    
+    # 检查标签合法性
+    invalid_labels = test_df[~test_df["true_label"].isin(LABEL_MAPPING.keys())]
+    if not invalid_labels.empty:
+        raise ValueError(f"❌ 测试集真实标签中存在无效标签：{invalid_labels['true_label'].unique()}")
+    
+    print(f"✅ 成功加载测试集真实标签：共 {len(test_df)} 条记录")
+    return test_df
+
+
+# ------------------------------
+# 4. 对齐真实标签与预测标签
+# ------------------------------
+def align_true_and_pred(true_df, pred_df):
+    """按id对齐真实标签与预测标签，返回整数编码后的y_true和y_pred"""
+    # 按id合并数据（确保一一对应）
+    merged_df = pd.merge(
+        true_df, 
+        pred_df, 
+        on="id", 
+        how="inner",  # 只保留两边都存在的id（避免缺失）
+        validate="one_to_one"  # 确保每个id只对应一条记录
+    )
+    
+    if len(merged_df) != len(true_df) or len(merged_df) != len(pred_df):
+        missing_ids_true = set(true_df["id"]) - set(merged_df["id"])
+        missing_ids_pred = set(pred_df["id"]) - set(merged_df["id"])
+        print(f"⚠️  警告：部分id未匹配")
+        if missing_ids_true:
+            print(f"   - 测试集存在但预测结果缺失的id数量：{len(missing_ids_true)}")
+        if missing_ids_pred:
+            print(f"   - 预测结果存在但测试集缺失的id数量：{len(missing_ids_pred)}")
+    
+    print(f"✅ 最终对齐的有效样本数：{len(merged_df)}")
+    
+    # 将文本标签转为整数（用于计算指标）
+    y_true = merged_df["true_label"].map(LABEL_MAPPING).values
+    y_pred = merged_df["predicted_emotion"].map(LABEL_MAPPING).values
+    
+    return y_true, y_pred, merged_df
+
+
+# ------------------------------
+# 5. 计算评估指标
+# ------------------------------
+def compute_evaluation_metrics(y_true, y_pred):
+    """计算多分类评估指标：准确率、宏F1、微F1、各类别F1"""
+    # 加载评估指标（与原训练代码一致使用evaluate库）
+    accuracy_metric = evaluate.load("accuracy")
+    f1_metric = evaluate.load("f1")
+    
+    # 计算整体指标
+    accuracy = accuracy_metric.compute(predictions=y_pred, references=y_true)["accuracy"]
+    f1_macro = f1_metric.compute(predictions=y_pred, references=y_true, average="macro")["f1"]
+    f1_micro = f1_metric.compute(predictions=y_pred, references=y_true, average="micro")["f1"]
+    
+    # 计算各类别单独F1
+    per_class_f1 = f1_metric.compute(predictions=y_pred, references=y_true, average=None)["f1"]
+    per_class_f1_dict = {ID2LABEL[i]: round(f1, 4) for i, f1 in enumerate(per_class_f1)}
+    
+    # 整理结果
+    metrics = {
+        "准确率(Accuracy)": round(accuracy, 4),
+        "宏F1(Macro-F1)": round(f1_macro, 4),
+        "微F1(Micro-F1)": round(f1_micro, 4),
+        "各类别F1(Per-Class F1)": per_class_f1_dict
+    }
+    
+    return metrics
+
+
+# ------------------------------
+# 6. 绘制混淆矩阵（可视化模型表现）
+# ------------------------------
+def plot_confusion_matrix(y_true, y_pred, save_path="./confusion_matrix.png"):
+    """绘制混淆矩阵并保存"""
+    # 计算混淆矩阵
+    cm = confusion_matrix(y_true, y_pred)
+    labels = [ID2LABEL[i] for i in range(len(LABEL_MAPPING))]
+    
+    # 绘制混淆矩阵
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 支持中文
+    plt.figure(figsize=(8, 6))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    disp.plot(cmap=plt.cm.Blues, xticks_rotation=45)
+    plt.title("情绪分类模型混淆矩阵", fontsize=14)
+    plt.ylabel("真实标签", fontsize=12)
+    plt.xlabel("预测标签", fontsize=12)
+    plt.tight_layout()  # 调整布局，避免标签被截断
+    
+    # 保存图片
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"✅ 混淆矩阵已保存至：{os.path.abspath(save_path)}")
+
+
+# ------------------------------
+# 7. 主函数：执行完整评估流程
+# ------------------------------
+def main():
+    print("=" * 50)
+    print("📊 开始模型评估流程")
+    print("=" * 50)
+    
+    # 步骤1：加载数据
+    pred_df = load_predictions(PREDICTION_PATH)
+    test_df = load_test_true_labels(TEST_DATA_PATH)
+    
+    # 步骤2：对齐标签
+    y_true, y_pred, merged_df = align_true_and_pred(test_df, pred_df)
+    
+    # 步骤3：计算指标
+    metrics = compute_evaluation_metrics(y_true, y_pred)
+    
+    # 步骤4：输出结果
+    print("\n" + "=" * 50)
+    print("📋 模型评估结果")
+    print("=" * 50)
+    for key, value in metrics.items():
+        if isinstance(value, dict):
+            print(f"\n{key}：")
+            for label, f1 in value.items():
+                print(f"   - {label}: {f1}")
+        else:
+            print(f"{key}：{value}")
+    
+    # 步骤5：绘制混淆矩阵
+    plot_confusion_matrix(y_true, y_pred)
+    
+    print("\n" + "=" * 50)
+    print("✅ 评估流程完成！")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()
