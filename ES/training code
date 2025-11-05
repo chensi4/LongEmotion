@@ -1,0 +1,114 @@
+import json
+import torch
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from transformers import (
+    T5Tokenizer,
+    T5ForConditionalGeneration,
+    DataCollatorForSeq2Seq,
+    TrainingArguments,
+    Trainer
+)
+from datasets import Dataset, DatasetDict
+
+
+# 1. 数据加载与预处理
+def load_jsonl_data(file_path):
+    """加载JSONL文件并转换为DataFrame"""
+    data = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            item = json.loads(line.strip())
+            # 构建输入文本（原始报告拼接）
+            input_text = (f"Cause: {item['predicted_cause']} "
+                          f"Symptoms: {item['predicted_symptoms']} "
+                          f"Treatment Process: {item['predicted_treatment_process']} "
+                          f"Illness Characteristics: {item['predicted_illness_Characteristics']} "
+                          f"Treatment Effect: {item['predicted_treatment_effect']}")
+            # 构建目标文本（结构化总结）
+            target_text = (f"1. Causes: {item['predicted_cause']}\n"
+                           f"2. Symptoms: {item['predicted_symptoms']}\n"
+                           f"3. Treatment Process: {item['predicted_treatment_process']}\n"
+                           f"4. Illness Characteristics: {item['predicted_illness_Characteristics']}\n"
+                           f"5. Treatment Effects: {item['predicted_treatment_effect']}")
+            data.append({
+                "input_text": input_text,
+                "target_text": target_text,
+                "id": item["id"]
+            })
+    return pd.DataFrame(data)
+
+
+# 2. 数据转换为Dataset并分词
+def preprocess_function(examples, tokenizer, max_input_length=512, max_target_length=512):
+    """对输入和目标文本进行分词"""
+    inputs = [f"summarize psychological report: {text}" for text in examples["input_text"]]
+    model_inputs = tokenizer(inputs, max_length=max_input_length, truncation=True, padding="max_length")
+    
+    # 处理目标文本
+    labels = tokenizer(examples["target_text"], max_length=max_target_length, truncation=True, padding="max_length")
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
+
+# 3. 模型训练主函数
+def train_model(jsonl_path, output_dir="./psych_model", model_name="t5-small"):
+    # 加载数据
+    df = load_jsonl_data(jsonl_path)
+    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+    
+    # 转换为Hugging Face Dataset
+    train_dataset = Dataset.from_pandas(train_df)
+    val_dataset = Dataset.from_pandas(val_df)
+    dataset_dict = DatasetDict({"train": train_dataset, "validation": val_dataset})
+    
+    # 加载tokenizer和模型
+    tokenizer = T5Tokenizer.from_pretrained(model_name)
+    model = T5ForConditionalGeneration.from_pretrained(model_name)
+    
+    # 分词处理
+    tokenized_datasets = dataset_dict.map(
+        lambda x: preprocess_function(x, tokenizer),
+        batched=True,
+        remove_columns=dataset_dict["train"].column_names
+    )
+    
+    # 数据收集器
+    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
+    
+    # 训练参数
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=3e-4,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        num_train_epochs=10,
+        weight_decay=0.01,
+        logging_dir="./logs",
+        logging_steps=10,
+        fp16=torch.cuda.is_available()  # 启用混合精度训练（如果有GPU）
+    )
+    
+    # 初始化Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_datasets["train"],
+        eval_dataset=tokenized_datasets["validation"],
+        tokenizer=tokenizer,
+        data_collator=data_collator
+    )
+    
+    # 开始训练
+    trainer.train()
+    # 保存最终模型
+    trainer.save_model(f"{output_dir}/final")
+    tokenizer.save_pretrained(f"{output_dir}/final")
+    print(f"模型训练完成，保存至 {output_dir}/final")
+
+
+if __name__ == "__main__":
+    # 替换为实际的JSONL文件路径
+    train_model(jsonl_path="./psych_reports.jsonl")
