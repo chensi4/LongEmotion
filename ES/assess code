@@ -1,0 +1,130 @@
+import json
+import openai
+import torch
+import pandas as pd
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+
+
+# 1. 配置OpenAI API
+openai.api_key = "your_openai_api_key"  # 替换为你的API密钥
+GPT_MODEL = "gpt-4o"
+
+
+# 2. 加载模型和数据
+def load_model_and_tokenizer(model_dir="./psych_model/final"):
+    """加载训练好的模型和tokenizer"""
+    tokenizer = T5Tokenizer.from_pretrained(model_dir)
+    model = T5ForConditionalGeneration.from_pretrained(model_dir)
+    model.eval()
+    return tokenizer, model
+
+
+def load_test_data(jsonl_path):
+    """加载测试数据（包含参考答案）"""
+    test_data = []
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            item = json.loads(line.strip())
+            # 构建参考总结（目标答案）
+            reference = (f"1. Causes: {item['predicted_cause']}\n"
+                         f"2. Symptoms: {item['predicted_symptoms']}\n"
+                         f"3. Treatment Process: {item['predicted_treatment_process']}\n"
+                         f"4. Illness Characteristics: {item['predicted_illness_Characteristics']}\n"
+                         f"5. Treatment Effects: {item['predicted_treatment_effect']}")
+            # 构建模型输入文本
+            input_text = (f"Cause: {item['predicted_cause']} "
+                          f"Symptoms: {item['predicted_symptoms']} "
+                          f"Treatment Process: {item['predicted_treatment_process']} "
+                          f"Illness Characteristics: {item['predicted_illness_Characteristics']} "
+                          f"Treatment Effect: {item['predicted_treatment_effect']}")
+            test_data.append({
+                "id": item["id"],
+                "input_text": input_text,
+                "reference": reference
+            })
+    return test_data
+
+
+# 3. 模型生成总结
+def generate_summary(input_text, tokenizer, model, max_length=512):
+    """使用训练好的模型生成总结"""
+    input_ids = tokenizer(
+        f"summarize psychological report: {input_text}",
+        return_tensors="pt",
+        max_length=512,
+        truncation=True,
+        padding="max_length"
+    ).input_ids
+    
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids,
+            max_length=max_length,
+            num_beams=4,
+            early_stopping=True
+        )
+    
+    return tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+
+# 4. 调用GPT-4o进行评估
+def evaluate_with_gpt4o(generated, reference):
+    """使用GPT-4o评估生成结果"""
+    prompt = f"""
+    任务：评估心理病理报告总结的质量。
+    参考答案：{reference}
+    模型生成结果：{generated}
+    
+    请从以下3个维度评分（1-5分，1分最差，5分最好），并给出理由：
+    1. 事实一致性：生成结果是否与参考答案的事实信息一致？
+    2. 完整性：生成结果是否涵盖了参考答案的所有关键信息？
+    3. 清晰度：生成结果的表述是否清晰、逻辑是否连贯？
+    
+    输出格式：
+    事实一致性：[分数]，理由：[具体说明]
+    完整性：[分数]，理由：[具体说明]
+    清晰度：[分数]，理由：[具体说明]
+    总体评分：[三个分数的平均分，保留两位小数]
+    """
+    
+    response = openai.ChatCompletion.create(
+        model=GPT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0  # 降低随机性，确保评估稳定性
+    )
+    
+    return response.choices[0].message["content"]
+
+
+# 5. 主评估流程
+def main_evaluation(jsonl_path):
+    # 加载模型和数据
+    tokenizer, model = load_model_and_tokenizer()
+    test_data = load_test_data(jsonl_path)
+    
+    # 存储评估结果
+    evaluation_results = []
+    
+    for item in test_data:
+        print(f"评估样本 ID: {item['id']}")
+        # 生成总结
+        generated = generate_summary(item["input_text"], tokenizer, model)
+        # 调用GPT-4o评估
+        gpt_evaluation = evaluate_with_gpt4o(generated, item["reference"])
+        # 保存结果
+        evaluation_results.append({
+            "id": item["id"],
+            "generated": generated,
+            "reference": item["reference"],
+            "evaluation": gpt_evaluation
+        })
+        print(f"完成评估 ID: {item['id']}\n")
+    
+    # 保存评估结果到JSON
+    with open("./evaluation_results.json", "w", encoding="utf-8") as f:
+        json.dump(evaluation_results, f, ensure_ascii=False, indent=2)
+    print("所有样本评估完成，结果保存至 evaluation_results.json")
+
+
+if __name__ == "__main__":
+    main_evaluation(jsonl_path="./psych_reports.jsonl")  # 替换为实际的JSONL文件路径
