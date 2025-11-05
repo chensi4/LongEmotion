@@ -1,0 +1,179 @@
+# -*- coding: utf-8 -*-
+import json
+import string
+import numpy as np
+from collections import Counter
+from nltk.tokenize import word_tokenize
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from rouge_score import rouge_scorer
+import nltk
+
+# 下载nltk依赖（首次运行需执行）
+nltk.download('punkt', quiet=True)
+
+
+class EvaluationConfig:
+    """评估参数配置（与数据来源无关）"""
+    # 文本预处理
+    lowercase = True
+    remove_punctuation = True
+    # 评估指标
+    bleu_ngrams = [1, 2, 3, 4]
+    diversity_ngrams = [1, 2]
+    rouge_types = ["rouge1", "rouge2", "rougeL"]
+
+
+def preprocess_text(text, config):
+    """文本预处理（统一格式）"""
+    if config.lowercase:
+        text = text.lower()
+    if config.remove_punctuation:
+        translator = str.maketrans("", "", string.punctuation)
+        text = text.translate(translator)
+    return text.strip()
+
+
+def parse_jsonl_data(input_data):
+    """
+    解析JSONL格式数据，支持多输入类型：
+    - 字符串（多行JSONL格式）
+    - 文件对象（如open()返回的对象）
+    - 列表（已解析的字典列表，如[{"id":0, "predicted_response": "..."}]）
+    返回：按id排序的predicted_response列表
+    """
+    parsed = []
+    if isinstance(input_data, list):
+        # 直接接收已解析的列表
+        parsed = input_data
+    elif isinstance(input_data, str):
+        # 接收JSONL字符串（按行解析）
+        for line in input_data.strip().split("\n"):
+            if line.strip():  # 跳过空行
+                parsed.append(json.loads(line))
+    else:
+        # 接收文件对象（如open("preds.jsonl", "r")）
+        for line in input_data:
+            if line.strip():
+                parsed.append(json.loads(line))
+    
+    # 按id排序，确保顺序一致
+    parsed_sorted = sorted(parsed, key=lambda x: x["id"])
+    # 提取predicted_response并预处理
+    config = EvaluationConfig()
+    pred_texts = [preprocess_text(item["predicted_response"], config) for item in parsed_sorted]
+    return pred_texts
+
+
+def calculate_diversity(pred_texts, config):
+    """计算生成文本的多样性指标（无需真实标签）"""
+    diversity = {}
+    # 句子重复率：1 - 独特句子数/总句子数
+    total = len(pred_texts)
+    unique = len(set(pred_texts))
+    diversity["sentence_repeat_rate"] = round(1 - (unique / total), 4)
+    
+    # n-gram独特率
+    for n in config.diversity_ngrams:
+        all_ngrams = []
+        for text in pred_texts:
+            tokens = word_tokenize(text)
+            ngrams = [tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1)] if len(tokens)>=n else []
+            all_ngrams.extend(ngrams)
+        total_ngrams = len(all_ngrams)
+        unique_ngrams = len(Counter(all_ngrams)) if total_ngrams > 0 else 0
+        diversity[f"{n}-gram_unique_rate"] = round(unique_ngrams / total_ngrams, 4) if total_ngrams > 0 else 0.0
+    return diversity
+
+
+def calculate_length_stats(pred_texts):
+    """计算生成文本的长度统计（无需真实标签）"""
+    lengths = [len(word_tokenize(text)) for text in pred_texts]
+    return {
+        "avg_length": round(np.mean(lengths), 2),
+        "std_length": round(np.std(lengths), 2),
+        "min_length": np.min(lengths),
+        "max_length": np.max(lengths)
+    }
+
+
+def calculate_bleu(pred_texts, true_texts, config):
+    """计算BLEU分数（需要真实标签）"""
+    smoothing = SmoothingFunction().method1
+    bleu_scores = {f"bleu-{n}": [] for n in config.bleu_ngrams}
+    for pred, true in zip(pred_texts, true_texts):
+        pred_tok = word_tokenize(pred)
+        true_tok = [word_tokenize(true)]  # 单参考文本
+        for n in config.bleu_ngrams:
+            weights = tuple([1/n]*n)
+            bleu = sentence_bleu(true_tok, pred_tok, weights=weights, smoothing_function=smoothing)
+            bleu_scores[f"bleu-{n}"].append(bleu)
+    return {k: round(np.mean(v), 4) for k, v in bleu_scores.items()}
+
+
+def calculate_rouge(pred_texts, true_texts, config):
+    """计算ROUGE分数（需要真实标签）"""
+    scorer = rouge_scorer.RougeScorer(config.rouge_types, use_stemmer=True)
+    rouge_scores = {rt: [] for rt in config.rouge_types}
+    for pred, true in zip(pred_texts, true_texts):
+        score = scorer.score(true, pred)
+        for rt in config.rouge_types:
+            rouge_scores[rt].append(score[rt].fmeasure)
+    return {k: round(np.mean(v), 4) for k, v in rouge_scores.items()}
+
+
+def evaluate_predictions(pred_data, true_data=None):
+    """
+    主评估函数：接收预测数据和可选的真实标签数据，返回评估结果
+    Args:
+        pred_data: JSONL格式数据（支持字符串、文件对象、列表，含"id"和"predicted_response"）
+        true_data: 可选，格式同pred_data，含"id"和"true_response"（用于计算BLEU/ROUGE）
+    Returns:
+        dict: 评估指标结果
+    """
+    config = EvaluationConfig()
+    results = {}
+    
+    # 解析预测数据
+    print("解析预测数据...")
+    pred_texts = parse_jsonl_data(pred_data)
+    results["basic_stats"] = {"sample_count": len(pred_texts)}
+    print(f"有效预测样本数：{len(pred_texts)}")
+    
+    # 计算无需真实标签的指标（多样性、长度）
+    print("计算多样性指标...")
+    results["diversity"] = calculate_diversity(pred_texts, config)
+    print("计算长度统计...")
+    results["length_stats"] = calculate_length_stats(pred_texts)
+    
+    # 若提供真实标签，计算BLEU和ROUGE
+    if true_data is not None:
+        print("解析真实标签数据...")
+        true_texts = parse_jsonl_data(true_data)  # 注意：true_data的字段应为"true_response"
+        if len(pred_texts) != len(true_texts):
+            raise ValueError(f"预测样本数（{len(pred_texts)}）与真实标签数（{len(true_texts)}）不匹配")
+        
+        print("计算BLEU分数...")
+        results["bleu"] = calculate_bleu(pred_texts, true_texts, config)
+        print("计算ROUGE分数...")
+        results["rouge"] = calculate_rouge(pred_texts, true_texts, config)
+    
+    return results
+
+
+# ---------------------- 示例使用 ----------------------
+if __name__ == "__main__":
+    # 示例1：从JSONL字符串评估（仅预测结果，无真实标签）
+    sample_jsonl = '''
+    {"id": 0, "predicted_response": "I absolutely loved this — the characters and story stayed with me long after reading."}
+    {"id": 1, "predicted_response": "Fantastic content! The pacing and insight were excellent. The conclusion could be stronger."}
+    {"id": 2, "predicted_response": "Excellent — clear, impactful, and well-structured. Some sections stood out for their clarity."}
+    '''
+    eval_results = evaluate_predictions(pred_data=sample_jsonl)
+    print("\n评估结果（仅预测数据）：")
+    import pprint
+    pprint.pprint(eval_results)
+    
+    # 示例2：从文件评估（假设有真实标签文件）
+    # with open("predictions.jsonl", "r") as f_pred, open("truth.jsonl", "r") as f_true:
+    #     eval_results = evaluate_predictions(pred_data=f_pred, true_data=f_true)
+    #     pprint.pprint(eval_results)
