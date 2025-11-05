@@ -1,0 +1,117 @@
+import os
+import torch
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# 中文显示配置
+plt.rcParams['font.sans-serif'] = ['SimHei', 'WenQuanYi Zen Hei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# 设备配置
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {device}")
+
+
+# ===================== 1. 读取本地IMDB数据集 =====================
+data_path = r'C:\Users\Student\PycharmProjects\PythonProject\IMDB_Dataset.csv'
+
+# 检查文件是否存在
+if not os.path.exists(data_path):
+    raise FileNotFoundError(f"请确认文件已重命名为：IMDB_Dataset.csv\n路径：{data_path}")
+
+# 读取数据
+df = pd.read_csv(data_path, encoding='utf-8').reset_index(drop=True)
+print(f"数据集加载成功，共 {len(df)} 条评论")
+
+# 列名配置（IMDB固定）
+text_col = 'review'
+label_col = 'sentiment'
+
+# 数据清洗
+df = df[[text_col, label_col]].dropna().drop_duplicates()
+print(f"清洗后有效样本数：{len(df)}")
+
+# 标签映射
+label2id = {'negative': 0, 'positive': 1}
+df[label_col] = df[label_col].map(label2id)
+print(f"标签映射：{label2id}，样本分布：{df[label_col].value_counts().to_dict()}")
+
+
+# ===================== 2. 文本向量化（无需联网） =====================
+vectorizer = CountVectorizer(max_features=2000, stop_words='english')
+X = vectorizer.fit_transform(df[text_col]).toarray()
+y = df[label_col].values
+
+# 划分训练集和测试集
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# 转换为PyTorch张量
+X_train = torch.FloatTensor(X_train).to(device)
+y_train = torch.LongTensor(y_train).to(device)
+X_test = torch.FloatTensor(X_test).to(device)
+y_test = torch.LongTensor(y_test).to(device)
+
+
+# ===================== 3. 简单神经网络模型 =====================
+class SimpleModel(torch.nn.Module):
+    def __init__(self, input_dim, output_dim=2):
+        super().__init__()
+        self.layers = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, 512),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.3),
+            torch.nn.Linear(512, 256),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.3),
+            torch.nn.Linear(256, output_dim)
+        )
+    
+    def forward(self, x):
+        return self.layers(x)
+
+model = SimpleModel(input_dim=X_train.shape[1]).to(device)
+criterion = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+
+# ===================== 4. 训练与评估 =====================
+train_losses = []
+test_accs = []
+num_epochs = 10
+
+for epoch in range(num_epochs):
+    model.train()
+    optimizer.zero_grad()
+    outputs = model(X_train)
+    loss = criterion(outputs, y_train)
+    loss.backward()
+    optimizer.step()
+    train_losses.append(loss.item())
+    
+    # 测试
+    model.eval()
+    with torch.no_grad():
+        test_outputs = model(X_test)
+        _, predicted = torch.max(test_outputs, 1)
+        acc = accuracy_score(y_test.cpu().numpy(), predicted.cpu().numpy())
+        test_accs.append(acc)
+    
+    print(f"Epoch {epoch+1}/{num_epochs} | 损失: {loss.item():.4f} | 准确率: {acc:.4f}")
+
+
+# 可视化
+plt.figure(figsize=(12, 5))
+plt.subplot(121)
+plt.plot(range(1, num_epochs+1), train_losses, 'bo-')
+plt.title("Loss")
+plt.subplot(122)
+plt.plot(range(1, num_epochs+1), test_accs, 'ro-')
+plt.title("Accuracy")
+plt.tight_layout()
+plt.show()
